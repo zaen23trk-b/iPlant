@@ -2,6 +2,7 @@ import network
 import time
 import socket
 import json
+import _thread
 from umqtt.simple import MQTTClient
 
 # ====================================
@@ -36,6 +37,9 @@ last_temp = "-"
 last_hum  = "-"
 last_soil = "-"
 
+# Lock untuk shared data (WAJIB di multithread)
+data_lock = _thread.allocate_lock()
+
 # ====================================
 # MQTT Callback
 # ====================================
@@ -43,20 +47,19 @@ def mqtt_callback(topic, msg):
     global last_temp, last_hum, last_soil
     try:
         data = json.loads(msg.decode())
-        last_temp = str(data.get("temperature", "-"))
-        last_hum  = str(data.get("humidity", "-"))
-        
-        # Ambil soil persentase saja
-        soil_data = data.get("soil_pct", {})
-        if isinstance(soil_data, dict):
-            last_soil = str(soil_data.get("soil_pct", "-"))
-        else:
-            last_soil = str(soil_data)  # fallback, kalau cuma nilai tunggal
-        
+        with data_lock:
+            last_temp = str(data.get("temperature", "-"))
+            last_hum  = str(data.get("humidity", "-"))
+
+            soil_data = data.get("soil_pct", {})
+            if isinstance(soil_data, dict):
+                last_soil = str(soil_data.get("soil_pct", "-"))
+            else:
+                last_soil = str(soil_data)
+
         print("MQTT Received:", data)
     except Exception as e:
         print("Failed to parse MQTT message:", e)
-
 
 def connect_mqtt():
     client = MQTTClient(MQTT_CLIENT_ID, MQTT_BROKER)
@@ -67,6 +70,22 @@ def connect_mqtt():
     return client
 
 client = connect_mqtt()
+
+# ====================================
+# MQTT THREAD
+# ====================================
+def mqtt_thread():
+    global client
+    while True:
+        try:
+            client.check_msg()
+        except OSError:
+            print("MQTT lost, reconnecting...")
+            client = connect_mqtt()
+        time.sleep(0.1)
+
+# Jalankan thread MQTT
+_thread.start_new_thread(mqtt_thread, ())
 
 # ====================================
 # Web Server
@@ -104,14 +123,14 @@ function fetchData() {
     })
     .catch(err => console.log(err));
 }
-setInterval(fetchData, 1000); // refresh tiap 1 detik
+setInterval(fetchData, 1000);
 </script>
 </head>
 <body>
-<h1>ESP32 Sensor Dashboard</h1>
+<h1>iPlant Dashboard</h1>
 
 <div class="card">
-    <div class="sensor-title">Temperature (°C)</div>
+    <div class="sensor-title">Temperature(°C)</div>
     <div id="temp" class="sensor-value">-</div>
 </div>
 
@@ -125,34 +144,28 @@ setInterval(fetchData, 1000); // refresh tiap 1 detik
     <div id="soil" class="sensor-value">-</div>
 </div>
 
-<footer>ESP32 Web Server & MQTT Dashboard</footer>
+<footer>Copyright iPlant</footer>
 </body>
 </html>
 """
 
 # ====================================
-# Main Loop
+# Main Loop (WEB SERVER)
 # ====================================
 while True:
-    # MQTT check
-    try:
-        client.check_msg()
-    except OSError:
-        print("MQTT lost, reconnecting...")
-        client = connect_mqtt()
-
-    # Web server request
     try:
         conn, addr = s.accept()
         request = conn.recv(1024)
         request = str(request)
 
         if "GET /data" in request:
-            response = json.dumps({
-                "temp": last_temp,
-                "hum": last_hum,
-                "soil": last_soil
-            })
+            with data_lock:
+                response = json.dumps({
+                    "temp": last_temp,
+                    "hum": last_hum,
+                    "soil": last_soil
+                })
+
             conn.send("HTTP/1.1 200 OK\n")
             conn.send("Content-Type: application/json\n")
             conn.send("Connection: close\n\n")
@@ -164,6 +177,7 @@ while True:
             conn.sendall(html)
 
         conn.close()
+
     except Exception as e:
         print("Web error:", e)
 
